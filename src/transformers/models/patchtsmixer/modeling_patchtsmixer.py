@@ -817,6 +817,23 @@ class PatchTSMixerPretrainHead(nn.Module):
         return forecast
 
 
+
+def point_masking(
+    inputs: torch.Tensor,
+    mask_ratio: float,
+    mask_value: int = 0,
+):
+    
+    B, T, N = inputs.shape
+    
+    mask = torch.rand((B, T, N)).to(inputs.device)
+    mask[mask <= mask_ratio] = 0  # masked
+    mask[mask > mask_ratio] = 1  # remained
+    masked_tensor = inputs.masked_fill(mask == 0, 0)
+    mask = ~mask.type(torch.bool)
+    return masked_tensor, mask
+
+
 # Copied from transformers.models.patchtst.modeling_patchtst.random_masking
 def random_masking(
     inputs: torch.Tensor,
@@ -1040,6 +1057,7 @@ class PatchTSMixerMasking(nn.Module):
                 channel_consistent_masking=self.channel_consistent_masking,
                 mask_value=self.mask_value,
             )
+            mask = mask.bool()
         elif self.mask_type == "forecast":
             masked_input, mask = forecast_masking(
                 inputs=patch_input,
@@ -1047,11 +1065,18 @@ class PatchTSMixerMasking(nn.Module):
                 unmasked_channel_indices=self.unmasked_channel_indices,
                 mask_value=self.mask_value,
             )
+            mask = mask.bool()
+        elif self.mask_type == "point":
+            masked_input, mask = point_masking(
+                inputs=patch_input,
+                mask_ratio=self.random_mask_ratio,
+                mask_value=self.mask_value,
+            )
         else:
             raise ValueError(f"Invalid mask type {self.mask_type}.")
 
         # mask: [bs x num_input_channels x num_patch]
-        mask = mask.bool()
+        
         return masked_input, mask
 
 
@@ -1066,7 +1091,7 @@ class PatchTSMixerStdScaler(nn.Module):
         super().__init__()
         self.dim = config.scaling_dim if hasattr(config, "scaling_dim") else 1
         self.keepdim = config.keepdim if hasattr(config, "keepdim") else True
-        self.minimum_scale = config.minimum_scale if hasattr(config, "minimum_scale") else 1e-5
+        self.minimum_scale = config.minimum_scale if hasattr(config, "minimum_scale") else 1e-3
 
     def forward(
         self, data: torch.Tensor, observed_indicator: torch.Tensor
@@ -1307,6 +1332,7 @@ class PatchTSMixerModel(PatchTSMixerPreTrainedModel):
         self.use_return_dict = config.use_return_dict
         self.encoder = PatchTSMixerEncoder(config)
         self.patching = PatchTSMixerPatchify(config)
+        self.mask_type = config.mask_type
 
         if mask_input is True:
             self.masking = PatchTSMixerMasking(config)
@@ -1343,17 +1369,25 @@ class PatchTSMixerModel(PatchTSMixerPreTrainedModel):
         Returns:
 
         """
-        return_dict = return_dict if return_dict is not None else self.use_return_dict
-
-        mask = None
         if observed_mask is None:
             observed_mask = torch.ones_like(past_values)
-        scaled_past_values, loc, scale = self.scaler(past_values, observed_mask)
+        
+        return_dict = return_dict if return_dict is not None else self.use_return_dict
+
+        temp_past_values = past_values
+        mask = None
+
+        if self.masking is not None and self.mask_type == "point":
+            temp_past_values, mask = self.masking(past_values)
+            observed_mask = ~mask
+            # print("ggg",observed_mask)
+
+        scaled_past_values, loc, scale = self.scaler(temp_past_values, observed_mask)
 
         patched_x = self.patching(scaled_past_values)  # [batch_size x num_input_channels x num_patch x patch_length
 
         enc_input = patched_x
-        if self.masking is not None:
+        if self.masking is not None and self.mask_type != "point":
             enc_input, mask = self.masking(patched_x)
             # enc_input: [batch_size x num_input_channels x num_patch x patch_length]
             # mask: [batch_size x num_input_channels x num_patch]
@@ -1410,6 +1444,7 @@ class PatchTSMixerForPreTrainingOutput(ModelOutput):
     prediction_outputs: torch.FloatTensor = None
     last_hidden_state: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    mask: torch.FloatTensor = None
 
 
 class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
@@ -1431,6 +1466,10 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
         self.masked_loss = config.masked_loss
         self.use_return_dict = config.use_return_dict
 
+        self.mask_type = config.mask_type
+
+
+
         # Initialize weights and apply final processing
         if config.post_init:
             self.post_init()
@@ -1444,6 +1483,7 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
         output_hidden_states: Optional[bool] = False,
         return_loss: bool = True,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> PatchTSMixerForPreTrainingOutput:
         r"""
         observed_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
@@ -1459,7 +1499,7 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.use_return_dict
 
-        if self.masked_loss is True:
+        if self.masked_loss is True and self.mask_type != "point":
             loss = torch.nn.MSELoss(reduction="none")
         else:
             loss = torch.nn.MSELoss(reduction="mean")
@@ -1475,15 +1515,24 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
             model_output = PatchTSMixerModelOutput(*model_output)
 
         x_hat = self.head(model_output.last_hidden_state)  # tensor [batch_size x nvars x num_patch x patch_length]
+        if self.mask_type == "point":
+            x_hat = x_hat.flatten(start_dim=-2).transpose(-1,-2)
+            x_hat = x_hat * model_output.scale + model_output.loc
+            original = past_values
+        else:
+            original = model_output.patch_input
 
         if return_loss is True:
-            loss_val = loss(x_hat, model_output.patch_input)
+            loss_val = loss(x_hat, original)
         else:
             loss_val = None
 
         # calculate masked_loss
         if self.masked_loss is True and loss_val is not None:
-            loss_val = (loss_val.mean(dim=-1) * model_output.mask).sum() / (model_output.mask.sum() + 1e-10)
+            if self.mask_type == "point":
+                loss_val = loss(x_hat[model_output.mask],original[model_output.mask])
+            else:
+                loss_val = (loss_val.mean(dim=-1) * model_output.mask).sum() / (model_output.mask.sum() + 1e-10)
 
         if not return_dict:
             return tuple(
@@ -1493,6 +1542,7 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
                     x_hat,
                     model_output.last_hidden_state,
                     model_output.hidden_states,
+                    model_output.mask,
                 ]
             )
 
@@ -1501,6 +1551,7 @@ class PatchTSMixerForPretraining(PatchTSMixerPreTrainedModel):
             prediction_outputs=x_hat,  # tensor [batch_size x nvars x num_patch x patch_length]
             last_hidden_state=model_output.last_hidden_state,  # x: [batch_size x nvars x num_patch x d_model]
             hidden_states=model_output.hidden_states,
+            mask = model_output.mask,
         )
 
 
